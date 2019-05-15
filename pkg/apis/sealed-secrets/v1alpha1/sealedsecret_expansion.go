@@ -64,6 +64,9 @@ func NewSealedSecretV1(codecs runtimeserializer.CodecFactory, pubKey *rsa.Public
 	if clusterWide {
 		s.Annotations = map[string]string{SealedSecretClusterWideAnnotation: "true"}
 	}
+	// add jenkins kubernetes-redential-provider annotation
+	s.Annotations = map[string]string{"jenkins.io/credentials-description": "credentials from kubernetes"}
+
 	return s, nil
 }
 

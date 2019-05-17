@@ -3,6 +3,7 @@ package v1alpha1
 import (
 	"bytes"
 	"crypto/rsa"
+	"fmt"
 	"io"
 	mathrand "math/rand"
 	"reflect"
@@ -154,6 +155,51 @@ func TestSealRoundTrip(t *testing.T) {
 	secret2, err := ssecret.Unseal(codecs, key)
 	if err != nil {
 		t.Fatalf("Unseal returned error: %v", err)
+	}
+
+	if !reflect.DeepEqual(secret.Data, secret2.Data) {
+		t.Errorf("Unsealed secret != original secret: %v != %v", secret, secret2)
+	}
+}
+
+func TestSealRoundTripWithJenkinsAnnotation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	codecs := serializer.NewCodecFactory(scheme)
+
+	SchemeBuilder.AddToScheme(scheme)
+	v1.SchemeBuilder.AddToScheme(scheme)
+
+	rand := testRand()
+	key, err := rsa.GenerateKey(rand, 2048)
+	if err != nil {
+		t.Fatalf("Failed to generate test key: %v", err)
+	}
+
+	secret := v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "myname",
+			Namespace: "myns",
+			Annotations: map[string]string{
+				JenkinsKubernetesCredentialProvider: "test description",
+			},
+		},
+		Data: map[string][]byte{
+			"foo": []byte("bar"),
+		},
+	}
+
+	ssecret, err := NewSealedSecret(codecs, &key.PublicKey, &secret)
+	if err != nil {
+		t.Fatalf("NewSealedSecret returned error: %v", err)
+	}
+
+	secret2, err := ssecret.Unseal(codecs, key)
+	if err != nil {
+		t.Fatalf("Unseal returned error: %v", err)
+	}
+
+	if !reflect.DeepEqual(secret.Annotations, secret2.Annotations) {
+		t.Errorf("Unsealed secret != original secret: %v != %v", secret, secret2)
 	}
 
 	if !reflect.DeepEqual(secret.Data, secret2.Data) {

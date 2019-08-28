@@ -1,52 +1,79 @@
 // This is the recommended cluster deployment of sealed-secrets.
 // See controller-norbac.jsonnet for the bare minimum functionality.
 
-local kube = import "kube.libsonnet";
-local controller = import "controller-norbac.jsonnet";
+local controller = import 'controller-norbac.jsonnet';
 
-controller + {
-  account: kube.ServiceAccount("sealed-secrets-controller") + $.namespace,
+controller {
+  local kube = self.kube,
 
-  unsealerRole: kube.ClusterRole("secrets-unsealer") {
+  account: kube.ServiceAccount('sealed-secrets-controller') + $.namespace,
+
+  unsealerRole: kube.ClusterRole('secrets-unsealer') {
     rules: [
       {
-        apiGroups: ["bitnami.com"],
-        resources: ["sealedsecrets"],
-        verbs: ["get", "list", "watch"],
+        apiGroups: ['bitnami.com'],
+        resources: ['sealedsecrets'],
+        verbs: ['get', 'list', 'watch', 'update'],
       },
       {
-        apiGroups: [""],
-        resources: ["secrets"],
-        verbs: ["create", "update", "delete", "get"],
+        apiGroups: [''],
+        resources: ['secrets'],
+        verbs: ['get', 'create', 'update', 'delete'],
+      },
+      {
+        apiGroups: [''],
+        resources: ['events'],
+        verbs: ['create', 'patch'],
       },
     ],
   },
 
-  unsealKeyRole: kube.Role("sealed-secrets-key-admin") + $.namespace {
+  unsealKeyRole: kube.Role('sealed-secrets-key-admin') + $.namespace {
     rules: [
       {
-        apiGroups: [""],
-        resources: ["secrets"],
-        resourceNames: ["sealed-secrets-key"],
-        verbs: ["get"],
-      },
-      {
-        apiGroups: [""],
-        resources: ["secrets"],
-        // Can't limit create by resourceName, because there's no resource yet
-        verbs: ["create"],
+        apiGroups: [''],
+        resources: ['secrets'],
+        // Can't limit create by resource name as keys are produced on the fly
+        verbs: ['create', 'list'],
       },
     ],
   },
 
-  unsealerBinding: kube.ClusterRoleBinding("sealed-secrets-controller") {
+  serviceProxierRole: kube.Role('sealed-secrets-service-proxier') + $.namespace {
+    rules: [
+      {
+        apiGroups: [
+          '',
+        ],
+        resources: [
+          'services/proxy',
+        ],
+        resourceNames: [
+          'http:sealed-secrets-controller:',  // kubeseal uses net.JoinSchemeNamePort when crafting proxy subresource URLs
+          'sealed-secrets-controller',  // but often services are referred by name only, let's not make it unnecessarily cryptic
+        ],
+        verbs: [
+          'get',
+        ],
+      },
+    ],
+  },
+
+  unsealerBinding: kube.ClusterRoleBinding('sealed-secrets-controller') {
     roleRef_: $.unsealerRole,
     subjects_+: [$.account],
   },
 
-  unsealKeyBinding: kube.RoleBinding("sealed-secrets-controller") + $.namespace {
+  unsealKeyBinding: kube.RoleBinding('sealed-secrets-controller') + $.namespace {
     roleRef_: $.unsealKeyRole,
     subjects_+: [$.account],
+  },
+
+  serviceProxierBinding: kube.RoleBinding('sealed-secrets-service-proxier') + $.namespace {
+    roleRef_: $.serviceProxierRole,
+    // kube.libsonnet assumes object here have a namespace, but system groups don't
+    // thus are not supposed to use the magic "_" here.
+    subjects+: [kube.Group('system:authenticated')],
   },
 
   controller+: {

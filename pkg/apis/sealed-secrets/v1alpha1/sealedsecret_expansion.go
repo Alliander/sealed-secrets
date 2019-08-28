@@ -3,15 +3,21 @@ package v1alpha1
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/base64"
 	"fmt"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	runtimeserializer "k8s.io/apimachinery/pkg/runtime/serializer"
 
 	"github.com/bitnami-labs/sealed-secrets/pkg/crypto"
 )
+
+// SealedSecretExpansion has methods to work with SealedSecrets resources.
+type SealedSecretExpansion interface {
+	Unseal(codecs runtimeserializer.CodecFactory, privKeys map[string]*rsa.PrivateKey) (*v1.Secret, error)
+}
 
 // Returns labels followed by clusterWide followed by namespaceWide.
 func labelFor(o metav1.Object) ([]byte, bool, bool) {
@@ -21,7 +27,7 @@ func labelFor(o metav1.Object) ([]byte, bool, bool) {
 	}
 	namespaceWide := o.GetAnnotations()[SealedSecretNamespaceWideAnnotation]
 	if namespaceWide == "true" {
-        return []byte(o.GetNamespace()), false, true
+		return []byte(o.GetNamespace()), false, true
 	}
 	return []byte(fmt.Sprintf("%s/%s", o.GetNamespace(), o.GetName())), false, false
 }
@@ -88,10 +94,14 @@ func NewSealedSecret(codecs runtimeserializer.CodecFactory, pubKey *rsa.PublicKe
 			Namespace: secret.GetNamespace(),
 		},
 		Spec: SealedSecretSpec{
-			EncryptedData: map[string][]byte{},
+			Template: SecretTemplateSpec{
+				// ObjectMeta copied below
+				Type: secret.Type,
+			},
+			EncryptedData: map[string]string{},
 		},
-		Type: secret.Type,
 	}
+	secret.ObjectMeta.DeepCopyInto(&s.Spec.Template.ObjectMeta)
 
 	// RSA-OAEP will fail to decrypt unless the same label is used
 	// during decryption.
@@ -102,11 +112,22 @@ func NewSealedSecret(codecs runtimeserializer.CodecFactory, pubKey *rsa.PublicKe
 		if err != nil {
 			return nil, err
 		}
-		s.Spec.EncryptedData[key] = ciphertext
+		s.Spec.EncryptedData[key] = base64.StdEncoding.EncodeToString(ciphertext)
+	}
+
+	for key, value := range secret.StringData {
+		ciphertext, err := crypto.HybridEncrypt(rand.Reader, pubKey, []byte(value), label)
+		if err != nil {
+			return nil, err
+		}
+		s.Spec.EncryptedData[key] = base64.StdEncoding.EncodeToString(ciphertext)
 	}
 
 	if clusterWide {
-		s.Annotations = map[string]string{SealedSecretClusterWideAnnotation: "true"}
+		if s.Annotations == nil {
+			s.Annotations = map[string]string{}
+		}
+		s.Annotations[SealedSecretClusterWideAnnotation] = "true"
 	}
 	if namespaceWide {
 		s.Annotations = map[string]string{SealedSecretNamespaceWideAnnotation: "true"}
@@ -115,7 +136,7 @@ func NewSealedSecret(codecs runtimeserializer.CodecFactory, pubKey *rsa.PublicKe
 }
 
 // Unseal decrypts and returns the embedded v1.Secret.
-func (s *SealedSecret) Unseal(codecs runtimeserializer.CodecFactory, privKey *rsa.PrivateKey) (*v1.Secret, error) {
+func (s *SealedSecret) Unseal(codecs runtimeserializer.CodecFactory, privKeys map[string]*rsa.PrivateKey) (*v1.Secret, error) {
 	boolTrue := true
 	smeta := s.GetObjectMeta()
 
@@ -127,17 +148,24 @@ func (s *SealedSecret) Unseal(codecs runtimeserializer.CodecFactory, privKey *rs
 
 	var secret v1.Secret
 	if len(s.Spec.EncryptedData) > 0 {
+		s.Spec.Template.ObjectMeta.DeepCopyInto(&secret.ObjectMeta)
+		secret.Type = s.Spec.Template.Type
+
 		secret.Data = map[string][]byte{}
 		for key, value := range s.Spec.EncryptedData {
-			plaintext, err := crypto.HybridDecrypt(rand.Reader, privKey, value, label)
+			valueBytes, err := base64.StdEncoding.DecodeString(value)
+			if err != nil {
+				return nil, err
+			}
+			plaintext, err := crypto.HybridDecrypt(rand.Reader, privKeys, valueBytes, label)
 			if err != nil {
 				return nil, err
 			}
 			secret.Data[key] = plaintext
 		}
-		secret.Type = s.Type
+
 	} else { // Support decrypting old secrets for backward compatibility
-		plaintext, err := crypto.HybridDecrypt(rand.Reader, privKey, s.Spec.Data, label)
+		plaintext, err := crypto.HybridDecrypt(rand.Reader, privKeys, s.Spec.Data, label)
 		if err != nil {
 			return nil, err
 		}

@@ -1,8 +1,8 @@
 language: go
 
 go:
-  - '1.9'
-  - '1.8'
+  - '1.12'
+  - '1.11'
 
 services:
   - docker
@@ -10,6 +10,8 @@ services:
 os:
   - linux
   - osx
+
+dist: xenial
 
 env:
   global:
@@ -24,9 +26,9 @@ env:
 
 matrix:
   include:
-    - env: INT_KVERS=v1.9.0 INT_SSC_CONF=controller.yaml
-    - env: INT_KVERS=v1.8.0 INT_SSC_CONF=controller.yaml
-    - env: INT_KVERS=v1.7.0 INT_SSC_CONF=controller.yaml
+    - env: INT_KVERS=v1.14.1 INT_SSC_CONF=controller.yaml
+    - env: INT_KVERS=v1.13.5 INT_SSC_CONF=controller.yaml
+    - env: INT_KVERS=v1.12.7 INT_SSC_CONF=controller.yaml
 
 addons:
   apt:
@@ -41,7 +43,7 @@ install:
   - go build -i ./...
   - |
     if [ "$INT_KVERS" != "" ]; then
-      v=0.25.0
+      v=1.0.0
       if ! which minikube-$v; then
         wget -O $GOPATH/bin/minikube-$v \
            https://storage.googleapis.com/minikube/releases/v$v/minikube-$(go env GOOS)-$(go env GOARCH)
@@ -56,35 +58,43 @@ install:
       fi
       ln -sf kubectl-$v $GOPATH/bin/kubectl
 
-      mkdir -p $(dirname $KUBECONFIG)
+      mkdir -p $(dirname $KUBECONFIG) $HOME/.minikube
       touch $KUBECONFIG
       sudo -E $GOPATH/bin/minikube start --vm-driver=none \
-        --extra-config apiserver.Authorization.Mode=RBAC \
+        --extra-config=apiserver.authorization-mode=RBAC \
         --kubernetes-version $INT_KVERS
+      sudo chown -R travis: /home/travis/.minikube/
 
       go get github.com/onsi/ginkgo/ginkgo
     fi
   - |
-    v=0.8.0
+    v=0.12.0
     if ! which kubecfg-$v; then
       wget -O $GOPATH/bin/kubecfg-$v https://github.com/ksonnet/kubecfg/releases/download/v$v/kubecfg-$(go env GOOS)-$(go env GOARCH)
       chmod +x $GOPATH/bin/kubecfg-$v
     fi
     ln -sf kubecfg-$v $GOPATH/bin/kubecfg
-  - git clone --depth=1 https://github.com/ksonnet/ksonnet-lib.git
-  - export KUBECFG_JPATH=$PWD/ksonnet-lib
 
 script:
+  # We want to support both go.mod aware builds and legacy builds.
+  # Instead of adding more combinations to the build matrix,
+  # we're going to use go 1.12 for the go.mod aware build
+  # and test the legacy build with go 1.11
+  - export USE_GO_MOD=no
+  - |
+    if [[ ${TRAVIS_GO_VERSION}.0 =~ ^1\.12\. ]]; then
+      export USE_GO_MOD=yes
+      make vet
+    fi
   - make
   - make test
-  - if [[ ${TRAVIS_GO_VERSION}.0 =~ ^1\.9\. ]]; then make vet; fi
   - make kubeseal-static
   - EXE_NAME=kubeseal-$(go env GOOS)-$(go env GOARCH)
   - cp kubeseal-static $EXE_NAME
   - ./$EXE_NAME --help || test $? -eq 2
   - |
     if [ "$TRAVIS_OS_NAME" = linux ]; then
-      make controller.yaml controller-norbac.yaml CONTROLLER_IMAGE=$CONTROLLER_IMAGE
+      make controller.yaml controller-norbac.yaml CONTROLLER_IMAGE=$CONTROLLER_IMAGE IMAGE_PULL_POLICY=Never
     fi
   - |
     if [ "$INT_KVERS" != "" ]; then
@@ -93,8 +103,18 @@ script:
       while ! kubectl cluster-info; do sleep 3; done
       kubectl create -f $INT_SSC_CONF
       kubectl rollout status deployment/sealed-secrets-controller -n kube-system -w
-      make integrationtest CONTROLLER_IMAGE=$CONTROLLER_IMAGE
+      make integrationtest CONTROLLER_IMAGE=$CONTROLLER_IMAGE GINKGO="ginkgo -v --randomizeSuites --failOnPending --trace --progress --compilers=2 --nodes=4"
     fi
+  # integration tests required Never pull policy, but release artifacts can't have that
+  # TODO(mkm): cleanup this.
+  - |
+    if [ "$TRAVIS_OS_NAME" = linux ]; then
+      rm -f controller.yaml controller-norbac.yaml
+      make controller.yaml controller-norbac.yaml CONTROLLER_IMAGE=$CONTROLLER_IMAGE
+    fi
+  - rm -f kubeseal-static
+  - GOOS=windows GOARCH=amd64 make kubeseal-static
+  - cp kubeseal-static kubeseal.exe
 
 after_script: set +e
 
@@ -104,7 +124,7 @@ after_success:
     if [[ "$TRAVIS_OS_NAME" == linux && \
           "$TRAVIS_BRANCH" == master && \
           "$TRAVIS_PULL_REQUEST" == false && \
-          "$TRAVIS_GO_VERSION.0" =~ ^1\.9\. ]]; then
+          "$TRAVIS_GO_VERSION.0" =~ ^1\.12\. ]]; then
       echo "Pushing :latest..."
       docker login -u="$DOCKER_USERNAME" -p="$DOCKER_PASSWORD" quay.io
       docker tag $CONTROLLER_IMAGE ${CONTROLLER_IMAGE_NAME}:latest
@@ -120,13 +140,14 @@ before_deploy:
 
 deploy:
   api_key:
-    secure: Bp7TwgtJVDnYSwXAP7uRHN1uXGILOvOASNDGHJI69GB+lG0RU6zqdOQJw8kKWjA67cKSW8RIuQuVlRsuNce3xa9sh1pB4OVZEJGoOiZrLVCM9s+iACuGjuKJB/GYLDDHhZYUTHp6o2Fymud9XhgqU/zpo/vAeVOTlGpj09dwZ0ZHAhivrx9Ubruo5uBgOe/nIcSDnQ9u5if0TOK4rg3EtxFf1ihiu6UXxZKjdi0Hqow8sQOjtqg82iAgpWwYRSIL4ePWear2FpnNMfIvRIMe7DNZvZ6uE9t/wkbLPOlTKSmkYw2YqOw4BvnDa7s8XcsOEzJHvyLh8sSrRFNR2VEiGuGDUPKJEpTJ+88ay7aeN0OLopAxMY0eTECWEKpFIJj6T48PoudevnT+HEBkvy4EkM4zEaf1HATMkZHUIL9qLY//hdMA2/usptLfZMqA2Ouj80Tpzr0AQ1u0QF7CYZt5Ga3YBoCt7yXfhKJ3w5i5EcObTcZBKXi5ScGdri3KfkB1CUuGrp1e/QDo1VWkLhoIGCJvCZnZGH7qDCH8gGyxWvIWTEro+yhmUg+I8786lqDzWLFKCA3NGf0b1W7nvI4pmsGRG5dIrWmpSUfaIJRDqi5R8Nj5S+VV3sdq/bT8+4n4yHcZnDQKdoCjO6K/WBTYBiq8igCIJ3obaWeH8i/XHLg=
+    secure: Q+/wLh9Qbe3dMmmBF1x2Qt5PqdHyHD+wjiRX0fV+leFtNjWEAgcSBrnPxhQVYrvL/tk/In/r9NlvO3VrCv7C11nkYEn5S7RJLIq6+v37Q789hBLchs5dH2FAwNyjA2Sezaf6ulYgqtouuy6Pt0ZY18/rjMcdKl1bYS+TeQU63eRWENgoHI0/yU6fR7w0q0Hjin+a1HCtn0K6YNxc51A0Rc/7TnYgDBSq74cpq+1xsazLrtDXrbtv6+WND5Oe702fwDM/C1b7k8jbmGPstVIWGKA0lfmzaTZUvuNyXbBzz76yBLXrDo41VhS9aBwWoIshTJhVGIl0rr8hy4K0J+MExsmUpp9ZLTwPXd4kFrEWPHFzA6oMNQknO0Lw92O85YpyJ9Jq8c2gPB+/syurhgKjmOHr+x/uGUUlXrYRnuaL/4Wqz5r+UiGcBGGiU9DLn1K8emgChf2FjkA009T/0o0cvUAS3c9WAeqv7P37EJUxpjL3+LrGlaKZaAAo/xAIO100YJ12SAfo0e8TSiMUQ2dngsWxDfWw5Yj90iyx9QE0XswkR5cKU6hsDzRR1xTmtv/jwyMrlgg7/UIQUkvQFZvC7NlkNcEMGCUCIE+Uc41Hh5L6OFqUvb7f/ULQ6D+vJ0wEMteIQolJh7mWSAUUmTiYKYKMR+RikEUtlJg5+TUZ+Y4=
   file:
     - $EXE_NAME
+    - kubeseal.exe
     - controller.yaml
     - controller-norbac.yaml
   on:
-    condition: ${TRAVIS_GO_VERSION}.0 =~ ^1\.9\.
+    condition: ${TRAVIS_GO_VERSION}.0 =~ ^1\.12\.
     tags: true
   provider: releases
   skip_cleanup: true

@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/x509"
+	"encoding/pem"
 	"io"
 	"io/ioutil"
 	"log"
@@ -22,10 +23,14 @@ var (
 
 // Called on every request to /cert.  Errors will be logged and return a 500.
 type certProvider func() ([]*x509.Certificate, error)
-
 type secretChecker func([]byte) (bool, error)
+type secretRotator func([]byte) ([]byte, error)
 
-func httpserver(cp certProvider, sc secretChecker) {
+// httpserver starts an HTTP that exposes core functionality like serving the public key
+// or secret rotation and validation. This endpoint is designed to be accessible by
+// all users of a given cluster. It must not leak any secret material.
+// The server is started in the background and a handle to it returned so it can be shut down.
+func httpserver(cp certProvider, sc secretChecker, sr secretRotator) *http.Server {
 	httpRateLimiter := rateLimter()
 
 	mux := http.NewServeMux()
@@ -57,23 +62,41 @@ func httpserver(cp certProvider, sc secretChecker) {
 		} else {
 			w.WriteHeader(http.StatusConflict)
 		}
-
 	})))
+
+	mux.HandleFunc("/v1/rotate", func(w http.ResponseWriter, r *http.Request) {
+		content, err := ioutil.ReadAll(r.Body)
+
+		if err != nil {
+			log.Printf("Error handling /v1/rotate request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		newSecret, err := sr(content)
+
+		if err != nil {
+			log.Printf("Error rotating secret: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(newSecret)
+	})
 
 	mux.HandleFunc("/v1/cert.pem", func(w http.ResponseWriter, r *http.Request) {
 		certs, err := cp()
-
 		if err != nil {
-			log.Printf("Error handling /cert request: %v", err)
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			w.WriteHeader(http.StatusInternalServerError)
-			io.WriteString(w, "Internal error\n")
+			log.Printf("cannot get certificates: %v", err)
+			http.Error(w, "cannot get certificate", http.StatusInternalServerError)
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/x-pem-file")
 		for _, cert := range certs {
-			w.Write(certUtil.EncodeCertPEM(cert))
+			w.Write(pem.EncodeToMemory(&pem.Block{Type: certUtil.CertificateBlockType, Bytes: cert.Raw}))
 		}
 	})
 
@@ -85,8 +108,11 @@ func httpserver(cp certProvider, sc secretChecker) {
 	}
 
 	log.Printf("HTTP server serving on %s", server.Addr)
-	err := server.ListenAndServe()
-	log.Printf("HTTP server exiting: %v", err)
+	go func() {
+		err := server.ListenAndServe()
+		log.Printf("HTTP server exiting: %v", err)
+	}()
+	return &server
 }
 
 func rateLimter() throttled.HTTPRateLimiter {

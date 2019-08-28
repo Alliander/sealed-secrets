@@ -2,39 +2,64 @@ package main
 
 import (
 	"crypto/rsa"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
-	"k8s.io/apimachinery/pkg/runtime"
-
-	apiv1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	runtimeserializer "k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/kubernetes/typed/core/v1"
+	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 
 	ssv1alpha1 "github.com/bitnami-labs/sealed-secrets/pkg/apis/sealed-secrets/v1alpha1"
+	ssclientset "github.com/bitnami-labs/sealed-secrets/pkg/client/clientset/versioned"
+	ssscheme "github.com/bitnami-labs/sealed-secrets/pkg/client/clientset/versioned/scheme"
+	ssv1alpha1client "github.com/bitnami-labs/sealed-secrets/pkg/client/clientset/versioned/typed/sealed-secrets/v1alpha1"
 	ssinformer "github.com/bitnami-labs/sealed-secrets/pkg/client/informers/externalversions"
 )
 
-const maxRetries = 5
+const (
+	maxRetries = 5
+
+	// SuccessUnsealed is used as part of the Event 'reason' when
+	// a SealedSecret is unsealed successfully.
+	SuccessUnsealed = "Unsealed"
+
+	// ErrUpdateFailed is used as part of the Event 'reason' when
+	// a SealedSecret fails to update the target Secret for a
+	// non-cryptography reason. Typically this is due to API I/O
+	// or RBAC issues.
+	ErrUpdateFailed = "ErrUpdateFailed"
+
+	// ErrUnsealFailed is used as part of the Event 'reason' when a
+	// SealedSecret fails the unsealing process.  Typically this
+	// is because it is encrypted with the wrong key or has been
+	// renamed from its original namespace/name.
+	ErrUnsealFailed = "ErrUnsealFailed"
+)
 
 // Controller implements the main sealed-secrets-controller loop.
 type Controller struct {
-	queue    workqueue.RateLimitingInterface
-	informer cache.SharedIndexInformer
-	sclient  v1.SecretsGetter
-	privKey  *rsa.PrivateKey
+	queue       workqueue.RateLimitingInterface
+	informer    cache.SharedIndexInformer
+	sclient     v1.SecretsGetter
+	ssclient    ssv1alpha1client.SealedSecretsGetter
+	recorder    record.EventRecorder
+	keyRegistry *KeyRegistry
 }
 
-func unseal(sclient v1.SecretsGetter, codecs runtimeserializer.CodecFactory, key *rsa.PrivateKey, ssecret *ssv1alpha1.SealedSecret) error {
+func unseal(sclient v1.SecretsGetter, codecs runtimeserializer.CodecFactory, keyRegistry *KeyRegistry, ssecret *ssv1alpha1.SealedSecret) error {
 	// Important: Be careful not to reveal the namespace/name of
 	// the *decrypted* Secret (or any other detail) in error/log
 	// messages.
@@ -42,7 +67,7 @@ func unseal(sclient v1.SecretsGetter, codecs runtimeserializer.CodecFactory, key
 	objName := fmt.Sprintf("%s/%s", ssecret.GetObjectMeta().GetNamespace(), ssecret.GetObjectMeta().GetName())
 	log.Printf("Updating %s", objName)
 
-	secret, err := ssecret.Unseal(codecs, key)
+	secret, err := attemptUnseal(ssecret, keyRegistry)
 	if err != nil {
 		// TODO: Add error event
 		return err
@@ -62,8 +87,14 @@ func unseal(sclient v1.SecretsGetter, codecs runtimeserializer.CodecFactory, key
 }
 
 // NewController returns the main sealed-secrets controller loop.
-func NewController(clientset kubernetes.Interface, ssinformer ssinformer.SharedInformerFactory, privKey *rsa.PrivateKey) *Controller {
+func NewController(clientset kubernetes.Interface, ssclientset ssclientset.Interface, ssinformer ssinformer.SharedInformerFactory, keyRegistry *KeyRegistry) *Controller {
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+
+	ssscheme.AddToScheme(scheme.Scheme)
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartLogging(log.Printf)
+	eventBroadcaster.StartRecordingToSink(&v1.EventSinkImpl{Interface: clientset.CoreV1().Events("")})
+	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "sealed-secrets"})
 
 	informer := ssinformer.Bitnami().V1alpha1().
 		SealedSecrets().
@@ -91,10 +122,12 @@ func NewController(clientset kubernetes.Interface, ssinformer ssinformer.SharedI
 	})
 
 	return &Controller{
-		informer: informer,
-		queue:    queue,
-		sclient:  clientset.Core(),
-		privKey:  privKey,
+		informer:    informer,
+		queue:       queue,
+		sclient:     clientset.CoreV1(),
+		ssclient:    ssclientset.BitnamiV1alpha1(),
+		recorder:    recorder,
+		keyRegistry: keyRegistry,
 	}
 }
 
@@ -185,31 +218,66 @@ func (c *Controller) unseal(key string) error {
 	ssecret := obj.(*ssv1alpha1.SealedSecret)
 	log.Printf("Updating %s", key)
 
-	secret, err := ssecret.Unseal(scheme.Codecs, c.privKey)
+	newSecret, err := c.attemptUnseal(ssecret)
 	if err != nil {
+		c.recorder.Eventf(ssecret, corev1.EventTypeWarning, ErrUnsealFailed, "Failed to unseal: %v", err)
 		return err
 	}
 
-	_, err = c.sclient.Secrets(ssecret.GetObjectMeta().GetNamespace()).Create(secret)
-	if err == nil {
-		// Secret successfully created
-		return nil
+	secret, err := c.sclient.Secrets(ssecret.GetObjectMeta().GetNamespace()).Get(newSecret.GetObjectMeta().GetName(), metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		secret, err = c.sclient.Secrets(ssecret.GetObjectMeta().GetNamespace()).Create(newSecret)
 	}
-	if !errors.IsAlreadyExists(err) {
-		// Error wasn't already exists so is real error
+	if err != nil {
+		c.recorder.Event(ssecret, corev1.EventTypeWarning, ErrUpdateFailed, err.Error())
 		return err
 	}
 
-	// Secret already exists so update it in place with new data/owner reference
-	updatedSecret, err := c.updateSecret(secret)
-	if err != nil {
-		return fmt.Errorf("failed to update existing secret: %s", err)
+	if !metav1.IsControlledBy(secret, ssecret) {
+		msg := fmt.Sprintf("Resource %q already exists and is not managed by SealedSecret", secret.Name)
+		c.recorder.Event(ssecret, corev1.EventTypeWarning, ErrUpdateFailed, msg)
+		return fmt.Errorf("failed update: %s", msg)
 	}
-	_, err = c.sclient.Secrets(ssecret.GetObjectMeta().GetNamespace()).Update(updatedSecret)
+
+	origSecret := secret
+	secret = secret.DeepCopy()
+
+	secret.Data = newSecret.Data
+	secret.Type = newSecret.Type
+	secret.ObjectMeta.Annotations = newSecret.ObjectMeta.Annotations
+	secret.ObjectMeta.Labels = newSecret.ObjectMeta.Labels
+
+	if !apiequality.Semantic.DeepEqual(origSecret, secret) {
+		secret, err = c.sclient.Secrets(ssecret.GetObjectMeta().GetNamespace()).Update(secret)
+		if err != nil {
+			c.recorder.Event(ssecret, corev1.EventTypeWarning, ErrUpdateFailed, err.Error())
+			return err
+		}
+	}
+
+	err = c.updateSealedSecretStatus(ssecret, secret)
+	if err != nil {
+		// Non-fatal.  Log and continue.
+		log.Printf("Error updating SealedSecret %s status: %v", key, err)
+	}
+
+	c.recorder.Event(ssecret, corev1.EventTypeNormal, SuccessUnsealed, "SealedSecret unsealed successfully")
+	return nil
+}
+
+func (c *Controller) updateSealedSecretStatus(ssecret *ssv1alpha1.SealedSecret, secret *corev1.Secret) error {
+	ssecret = ssecret.DeepCopy()
+
+	ssecret.Status.ObservedGeneration = secret.ObjectMeta.Generation
+
+	// TODO: Use UpdateStatus when k8s CustomResourceSubresources
+	// feature is widespread.
+	var err error
+	ssecret, err = c.ssclient.SealedSecrets(ssecret.GetObjectMeta().GetNamespace()).Update(ssecret)
 	return err
 }
 
-func (c *Controller) updateSecret(newSecret *apiv1.Secret) (*apiv1.Secret, error) {
+func (c *Controller) updateSecret(newSecret *corev1.Secret) (*corev1.Secret, error) {
 	existingSecret, err := c.sclient.Secrets(newSecret.GetObjectMeta().GetNamespace()).Get(newSecret.GetObjectMeta().GetName(), metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to read existing secret: %s", err)
@@ -222,7 +290,7 @@ func (c *Controller) updateSecret(newSecret *apiv1.Secret) (*apiv1.Secret, error
 	return existingSecret, nil
 }
 
-func (c *Controller) updateOwnerReferences(existing, new *apiv1.Secret) {
+func (c *Controller) updateOwnerReferences(existing, new *corev1.Secret) {
 	ownerRefs := existing.GetOwnerReferences()
 
 	for _, newRef := range new.GetOwnerReferences() {
@@ -248,7 +316,7 @@ func (c *Controller) AttemptUnseal(content []byte) (bool, error) {
 
 	switch s := object.(type) {
 	case *ssv1alpha1.SealedSecret:
-		if _, err := s.Unseal(scheme.Codecs, c.privKey); err != nil {
+		if _, err := c.attemptUnseal(s); err != nil {
 			return false, nil
 		}
 		return true, nil
@@ -256,4 +324,46 @@ func (c *Controller) AttemptUnseal(content []byte) (bool, error) {
 		return false, fmt.Errorf("Unexpected resource type: %s", s.GetObjectKind().GroupVersionKind().String())
 
 	}
+}
+
+// Rotate takes a sealed secret and returns a sealed secret that has been encrypted
+// with the latest private key. If the secret is already encrypted with the latest,
+// returns the input.
+func (c *Controller) Rotate(content []byte) ([]byte, error) {
+	object, err := runtime.Decode(scheme.Codecs.UniversalDecoder(ssv1alpha1.SchemeGroupVersion), content)
+	if err != nil {
+		return nil, err
+	}
+
+	switch s := object.(type) {
+	case *ssv1alpha1.SealedSecret:
+		secret, err := c.attemptUnseal(s)
+		if err != nil {
+			return nil, fmt.Errorf("Error decrypting secret. %v", err)
+		}
+		latestPrivKey := c.keyRegistry.latestPrivateKey()
+		resealedSecret, err := ssv1alpha1.NewSealedSecret(scheme.Codecs, &latestPrivKey.PublicKey, secret)
+		if err != nil {
+			return nil, fmt.Errorf("Error creating new sealed secret. %v", err)
+		}
+		data, err := json.Marshal(resealedSecret)
+		if err != nil {
+			return nil, fmt.Errorf("Error marshalling new secret to json. %v", err)
+		}
+		return data, nil
+	default:
+		return nil, fmt.Errorf("Unexpected resource type: %s", s.GetObjectKind().GroupVersionKind().String())
+	}
+}
+
+func (c *Controller) attemptUnseal(ss *ssv1alpha1.SealedSecret) (*corev1.Secret, error) {
+	return attemptUnseal(ss, c.keyRegistry)
+}
+
+func attemptUnseal(ss *ssv1alpha1.SealedSecret, keyRegistry *KeyRegistry) (*corev1.Secret, error) {
+	privateKeys := map[string]*rsa.PrivateKey{}
+	for k, v := range keyRegistry.keys {
+		privateKeys[k] = v.private
+	}
+	return ss.Unseal(scheme.Codecs, privateKeys)
 }

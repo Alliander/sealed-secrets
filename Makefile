@@ -1,16 +1,24 @@
 GO = go
-GO_FLAGS =
 GOFMT = gofmt
 
-KUBECFG = kubecfg -U https://github.com/bitnami-labs/kube-libsonnet/raw/52ba963ca44f7a4960aeae9ee0fbee44726e481f
+USE_GO_MOD := $(shell echo $${USE_GO_MOD:-yes})
+ifeq ($(USE_GO_MOD),yes)
+export GO111MODULE = on
+GO_FLAGS = -mod=vendor
+else
+export GO111MODULE = off
+GO_FLAGS =
+endif
+
+KUBECFG = kubecfg
 DOCKER = docker
 GINKGO = ginkgo -p
 
-CONTROLLER_IMAGE = sealed-secrets-controller:latest
+CONTROLLER_IMAGE = quay.io/bitnami/sealed-secrets-controller:latest
+IMAGE_PULL_POLICY = Always
 KUBECONFIG ?= $(HOME)/.kube/config
 
-# TODO: Simplify this once ./... ignores ./vendor
-GO_PACKAGES = ./cmd/... ./pkg/...
+GO_PACKAGES = ./...
 GO_FILES := $(shell find $(shell $(GO) list -f '{{.Dir}}' $(GO_PACKAGES)) -name \*.go)
 
 COMMIT = $(shell git rev-parse HEAD)
@@ -54,7 +62,7 @@ controller.image: docker/Dockerfile docker/controller
 	mv $@.tmp $@
 
 %.yaml: %.jsonnet
-	$(KUBECFG) show -V CONTROLLER_IMAGE=$(CONTROLLER_IMAGE) -o yaml $< > $@.tmp
+	$(KUBECFG) show -V CONTROLLER_IMAGE=$(CONTROLLER_IMAGE) -V IMAGE_PULL_POLICY=$(IMAGE_PULL_POLICY) -o yaml $< > $@.tmp
 	mv $@.tmp $@
 
 controller.yaml: controller.jsonnet controller.image controller-norbac.jsonnet

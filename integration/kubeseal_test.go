@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/pem"
 	"io"
 	"io/ioutil"
 	"os"
@@ -13,7 +14,7 @@ import (
 	ssv1alpha1 "github.com/bitnami-labs/sealed-secrets/pkg/apis/sealed-secrets/v1alpha1"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -31,7 +32,7 @@ var _ = Describe("kubeseal", func() {
 	var input *v1.Secret
 	var ss *ssv1alpha1.SealedSecret
 	var args []string
-	var privKey *rsa.PrivateKey
+	var privKeys map[string]*rsa.PrivateKey
 	var certs []*x509.Certificate
 	var config *clientcmdapi.Config
 	var kubeconfigFile string
@@ -79,7 +80,7 @@ var _ = Describe("kubeseal", func() {
 		}
 
 		var err error
-		privKey, certs, err = fetchKeys(c)
+		privKeys, certs, err = fetchKeys(c)
 		Expect(err).NotTo(HaveOccurred())
 	})
 
@@ -102,7 +103,7 @@ var _ = Describe("kubeseal", func() {
 		})
 
 		It("should contain the right value", func() {
-			s, err := ss.Unseal(scheme.Codecs, privKey)
+			s, err := ss.Unseal(scheme.Codecs, privKeys)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(s.Data).To(HaveKeyWithValue("foo", []byte("bar")))
 		})
@@ -121,7 +122,7 @@ var _ = Describe("kubeseal", func() {
 		})
 
 		It("should qualify the Secret", func() {
-			s, err := ss.Unseal(scheme.Codecs, privKey)
+			s, err := ss.Unseal(scheme.Codecs, privKeys)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(s.GetNamespace()).To(Equal(testNs))
 		})
@@ -138,7 +139,7 @@ var _ = Describe("kubeseal", func() {
 		})
 
 		It("should qualify the Secret", func() {
-			s, err := ss.Unseal(scheme.Codecs, privKey)
+			s, err := ss.Unseal(scheme.Codecs, privKeys)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(s.GetNamespace()).To(Equal(testNs))
 		})
@@ -159,7 +160,7 @@ var _ = Describe("kubeseal", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			for _, cert := range certs {
-				certfile.Write(certUtil.EncodeCertPEM(cert))
+				certfile.Write(pem.EncodeToMemory(&pem.Block{Type: certUtil.CertificateBlockType, Bytes: cert.Raw}))
 			}
 			certfile.Close()
 
@@ -173,7 +174,7 @@ var _ = Describe("kubeseal", func() {
 		})
 
 		It("should output the right value", func() {
-			s, err := ss.Unseal(scheme.Codecs, privKey)
+			s, err := ss.Unseal(scheme.Codecs, privKeys)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(s.Data).To(HaveKeyWithValue("foo", []byte("bar")))
 		})
@@ -227,7 +228,6 @@ var _ = Describe("kubeseal --version", func() {
 })
 
 var _ = Describe("kubeseal --verify", func() {
-	var c corev1.CoreV1Interface
 	const secretName = "testSecret"
 	const testNs = "testverifyns"
 	var input io.Reader
@@ -237,7 +237,6 @@ var _ = Describe("kubeseal --verify", func() {
 	var err error
 
 	BeforeEach(func() {
-		c = corev1.NewForConfigOrDie(clusterConfigOrDie())
 		args = append(args, "--validate")
 		output = &bytes.Buffer{}
 	})

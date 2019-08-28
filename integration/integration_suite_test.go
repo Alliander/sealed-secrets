@@ -3,7 +3,9 @@
 package integration
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -88,6 +90,41 @@ func runKubeseal(flags []string, input io.Reader, output io.Writer) error {
 	return runApp(*kubesealBin, args, input, output)
 }
 
+type interruptableReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r interruptableReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := r.r.Read(p)
+	if err != nil {
+		return n, err
+	}
+	return n, r.ctx.Err()
+}
+
+func streamLog(ctx context.Context, c corev1.PodsGetter, namespace, name, container string, output io.Writer, prefix string) error {
+	zero := int64(0)
+	readCloser, err := c.Pods(namespace).GetLogs(name, &v1.PodLogOptions{
+		Container:    container,
+		Follow:       true,
+		SinceSeconds: &zero,
+	}).Stream()
+	if err != nil {
+		return err
+	}
+	defer readCloser.Close()
+
+	scanner := bufio.NewScanner(interruptableReader{ctx, readCloser})
+	for scanner.Scan() {
+		fmt.Fprintf(output, "%s%s\n", prefix, scanner.Text())
+	}
+	return scanner.Err()
+}
+
 func runController(flags []string, input io.Reader, output io.Writer) error {
 	return runApp(*controllerBin, flags, input, output)
 }
@@ -109,7 +146,7 @@ func runKubesealWith(flags []string, input runtime.Object) (runtime.Object, erro
 		return nil, err
 	}
 
-	fmt.Fprintf(GinkgoWriter, "kubeseal input:\n%s", indata)
+	fmt.Fprintf(GinkgoWriter, "kubeseal input:\n%s\n", indata)
 
 	outbuf := bytes.Buffer{}
 
@@ -117,7 +154,7 @@ func runKubesealWith(flags []string, input runtime.Object) (runtime.Object, erro
 		return nil, err
 	}
 
-	fmt.Fprintf(GinkgoWriter, "kubeseal output:\n%s", outbuf.Bytes())
+	fmt.Fprintf(GinkgoWriter, "kubeseal output:\n%s\n", outbuf.Bytes())
 
 	outputObj, err := runtime.Decode(scheme.Codecs.UniversalDecoder(ssv1alpha1.SchemeGroupVersion), outbuf.Bytes())
 	if err != nil {
